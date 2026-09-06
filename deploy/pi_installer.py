@@ -6,7 +6,7 @@ It NEVER enables Internet forwarding. A rollback snapshot is written before
 managed files are changed.
 """
 from __future__ import annotations
-import argparse, os, shutil, subprocess, textwrap, time
+import argparse, os, shutil, subprocess, textwrap, time, pwd
 from pathlib import Path
 
 DEFAULTS = {
@@ -96,6 +96,51 @@ def render_nft(interface):
         }}
     """)
 
+def ensure_service_user(user: str = "internalwifi"):
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        run(["useradd", "--system", "--home", "/opt/internal-wifi", "--shell", "/usr/sbin/nologin", user])
+
+def install_application(source_dir: Path, app_dir: Path = Path("/opt/internal-wifi"), user: str = "internalwifi"):
+    app_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("app", "deploy", "systemd", "requirements.txt", "README.md"):
+        src = source_dir / name
+        dst = app_dir / name
+        if not src.exists():
+            continue
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+    venv = app_dir / ".venv"
+    run(["python3", "-m", "venv", str(venv)])
+    run([str(venv / "bin" / "pip"), "install", "--upgrade", "pip"])
+    run([str(venv / "bin" / "pip"), "install", "-r", str(app_dir / "requirements.txt")])
+    run(["chown", "-R", f"{user}:{user}", str(app_dir)])
+
+def write_runtime_env(admin_token: str, app_dir: Path = Path("/opt/internal-wifi")):
+    env_path = app_dir / ".env"
+    write(env_path, f"INTERNAL_WIFI_ADMIN_TOKEN={admin_token}\n", 0o600)
+    run(["chown", "internalwifi:internalwifi", str(env_path)])
+
+def persist_nftables(fragment: str = "/etc/nftables.d/internal-wifi.nft"):
+    nft_main = Path("/etc/nftables.conf")
+    include = f'include "{fragment}"'
+    current = nft_main.read_text() if nft_main.exists() else "#!/usr/sbin/nft -f\nflush ruleset\n"
+    if include not in current:
+        current = current.rstrip() + "\n" + include + "\n"
+        write(nft_main, current)
+    run(["systemctl", "enable", "nftables"])
+
+def install_api_service(source_dir: Path):
+    svc_src = source_dir / "systemd" / "internal-wifi-api.service"
+    svc_dst = Path("/etc/systemd/system/internal-wifi-api.service")
+    shutil.copy2(svc_src, svc_dst)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "internal-wifi-api.service"])
+    run(["systemctl", "restart", "internal-wifi-api.service"])
+
 def apply(args):
     missing = [k for k,v in detect().items() if not v]
     if missing:
@@ -107,12 +152,20 @@ def apply(args):
     if len(admin) < 24:
         raise SystemExit("Set INTERNAL_WIFI_ADMIN_TOKEN to a random value of at least 24 characters before --apply")
 
-    managed = ["/etc/hostapd/hostapd.conf", "/etc/dnsmasq.d/internal-wifi.conf", "/etc/nftables.d/internal-wifi.nft"]
+    managed = ["/etc/hostapd/hostapd.conf", "/etc/dnsmasq.d/internal-wifi.conf", "/etc/nftables.d/internal-wifi.nft", "/etc/nftables.conf", "/etc/systemd/system/internal-wifi-api.service"]
     snap = backup(managed)
     print(f"Rollback snapshot: {snap}")
     write(Path(managed[0]), render_hostapd(args.interface, args.ssid, args.country, psk), 0o600)
     write(Path(managed[1]), render_dnsmasq(args.interface, args.dhcp_start, args.dhcp_end))
     write(Path(managed[2]), render_nft(args.interface))
+
+    source_dir = Path(__file__).resolve().parents[1]
+    ensure_service_user()
+    install_application(source_dir)
+    write_runtime_env(admin)
+    persist_nftables(managed[2])
+    install_api_service(source_dir)
+
     run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
     run(["ip", "link", "set", args.interface, "up"])
     subprocess.run(["ip", "addr", "flush", "dev", args.interface], check=False)
