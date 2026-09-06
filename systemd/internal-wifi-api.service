@@ -1,0 +1,22 @@
+[Unit]
+Description=Internal Wi-Fi Platform API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=internalwifi
+Group=internalwifi
+WorkingDirectory=/opt/internal-wifi
+EnvironmentFile=-/etc/internal-wifi/api.env
+ExecStart=/opt/internal-wifi/.venv/bin/uvicorn app.main:app --host 192.168.50.1 --port 8080
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/internal-wifi
+
+[Install]
+WantedBy=multi-user.target
